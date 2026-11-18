@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from typing import IO, Any, BinaryIO
 
 import numpy.typing as npt
+from cs336_basics.alex_tokenizer import alex_tokenizer
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -589,4 +590,5 @@ def run_train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    raise NotImplementedError
+    t = alex_tokenizer(input_path, vocab_size, special_tokens, **kwargs)
+    return t
