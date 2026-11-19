@@ -12,25 +12,26 @@ PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s
 
 
 def find_chunk_boundaries(
-    file_path: str, num_chunks: int, delimiter: str = "<|endoftext|>"
+    file_path: str, chunk_size_bytes: int = 64 * 1024 * 1024, delimiter: str = "<|endoftext|>"
 ) -> List[Tuple[int, int]]:
     """
-    Splits a large text file into roughly equal byte ranges such that chunk boundaries
-    always land on document boundaries (after a special token delimiter).
+    Splits a large text file into modest chunks (~64MB by default) aligned on document boundaries.
+    This prevents huge memory allocations per process.
     """
     file_size = os.path.getsize(file_path)
-    chunk_size = file_size // num_chunks
     boundaries = []
 
     with open(file_path, "rb") as f:
         start = 0
         delimiter_bytes = delimiter.encode("utf-8")
 
-        for i in range(num_chunks - 1):
-            target = start + chunk_size
-            f.seek(target)
+        while start < file_size:
+            target = start + chunk_size_bytes
+            if target >= file_size:
+                boundaries.append((start, file_size))
+                break
 
-            # Read ahead until we find the delimiter end
+            f.seek(target)
             buffer = f.read(4096)
             pos = buffer.find(delimiter_bytes)
 
@@ -45,19 +46,14 @@ def find_chunk_boundaries(
 
             boundaries.append((start, end))
             start = end
-            if start >= file_size:
-                break
-
-        if start < file_size:
-            boundaries.append((start, file_size))
 
     return boundaries
 
 
 def process_chunk(args: Tuple[str, int, int, List[str]]) -> Dict[Tuple[bytes, ...], int]:
     """
-    Worker function: Reads a specific byte slice of the file, splits on special tokens,
-    and runs regex pre-tokenization to return local pre-token counts.
+    Worker function: Processes a 64MB slice, splits on special tokens,
+    and returns local pre-token counts.
     """
     file_path, start_byte, end_byte, special_tokens = args
     import regex as re  # Import within worker for multiprocessing safety
@@ -88,18 +84,21 @@ def process_chunk(args: Tuple[str, int, int, List[str]]) -> Dict[Tuple[bytes, ..
     return dict(local_counts)
 
 
-def train_bpe_tinystories(
+def train_bpe_streamed(
     input_path: str,
-    vocab_size: int = 10000,
+    vocab_size: int = 32000,
     special_tokens: List[str] = ["<|endoftext|>"],
+    chunk_size_mb: int = 64,
     num_workers: int = None,
-    vocab_out_path: str = "tinystories_vocab.json",
-    merges_out_path: str = "tinystories_merges.json",
+    vocab_out_path: str = "owt_vocab.json",
+    merges_out_path: str = "owt_merges.json",
 ):
     start_time = time.time()
     num_workers = num_workers or max(1, mp.cpu_count() - 1)
-    print(f"--- Starting BPE Training on {input_path} ---")
-    print(f"Workers: {num_workers} | Target Vocab Size: {vocab_size}")
+    chunk_size_bytes = chunk_size_mb * 1024 * 1024
+
+    print(f"--- Starting Streamed BPE Training on {input_path} ---")
+    print(f"Workers: {num_workers} | Chunk Size: {chunk_size_mb} MB | Target Vocab Size: {vocab_size}")
 
     # Step 1: Initialize Vocabulary
     vocabulary: Dict[int, bytes] = {}
@@ -108,25 +107,29 @@ def train_bpe_tinystories(
     offset = len(vocabulary)
     vocabulary.update({offset + i: bytes([i]) for i in range(256)})
 
-    # Step 2: Parallel Pre-tokenization
+    # Step 2: Streamed Parallel Pre-tokenization
     pretok_start = time.time()
-    print("Finding document-aligned chunk boundaries...")
-    boundaries = find_chunk_boundaries(
-        input_path,
-        num_workers,
-        delimiter=special_tokens[0] if special_tokens else "<|endoftext|>",
-    )
+    print("Calculating document-aligned stream chunk boundaries...")
+    delimiter = special_tokens[0] if special_tokens else "<|endoftext|>"
+    boundaries = find_chunk_boundaries(input_path, chunk_size_bytes=chunk_size_bytes, delimiter=delimiter)
+    print(f"Split file into {len(boundaries)} chunks of ~{chunk_size_mb} MB each.")
 
     worker_args = [(input_path, b[0], b[1], special_tokens) for b in boundaries]
 
-    print(f"Pre-tokenizing {len(boundaries)} chunks in parallel...")
-    with mp.Pool(processes=num_workers) as pool:
-        results = pool.map(process_chunk, worker_args)
-
     pre_token_counts = defaultdict(int)
-    for res in results:
-        for seq, count in res.items():
-            pre_token_counts[seq] += count
+    completed_chunks = 0
+    total_chunks = len(boundaries)
+
+    print(f"Pre-tokenizing streaming chunks across {num_workers} processes...")
+    with mp.Pool(processes=num_workers) as pool:
+        # imap_unordered streams results back as soon as chunks complete
+        for local_counts in pool.imap_unordered(process_chunk, worker_args, chunksize=1):
+            for seq, count in local_counts.items():
+                pre_token_counts[seq] += count
+            completed_chunks += 1
+            if completed_chunks % 10 == 0 or completed_chunks == total_chunks:
+                pct = (completed_chunks / total_chunks) * 100
+                print(f"  [Pre-tokenization] Processed {completed_chunks}/{total_chunks} chunks ({pct:.1f}%)...")
 
     pretok_time = time.time() - pretok_start
     print(f"Pre-tokenization completed in {pretok_time:.2f}s across {len(pre_token_counts)} unique pre-tokens.")
@@ -139,12 +142,14 @@ def train_bpe_tinystories(
     pair_counts = defaultdict(int)
     pair_to_words = defaultdict(set)
 
+    print("Building initial pair counts...")
     for word, count in pre_token_counts.items():
         for pair in zip(word, word[1:]):
             pair_counts[pair] += count
             pair_to_words[pair].add(word)
 
     print(f"Computing {iterations} BPE merges...")
+    log_interval = max(1000, iterations // 10)
     for step in range(iterations):
         if not pair_counts:
             break
@@ -194,6 +199,9 @@ def train_bpe_tinystories(
                 pair_counts[pair] += count
                 pair_to_words[pair].add(new_word)
 
+        if (step + 1) % log_interval == 0 or (step + 1) == iterations:
+            print(f"  [Merges] Completed {step + 1}/{iterations} merges ({(step + 1)/iterations*100:.1f}%)...")
+
     merge_time = time.time() - merge_start
     total_time = time.time() - start_time
 
@@ -212,7 +220,7 @@ def train_bpe_tinystories(
     with open(merges_out_path, "w", encoding="utf-8") as f:
         json.dump(serialized_merges, f, indent=2, ensure_ascii=False)
 
-    # Step 5: Answer Problem (train_bpe_tinystories) Deliverables
+    # Step 5: Summary & Deliverables
     longest_token_bytes = max(vocabulary.values(), key=len)
     longest_token_str = longest_token_bytes.decode("utf-8", errors="replace")
 
@@ -229,13 +237,16 @@ def train_bpe_tinystories(
 
 
 if __name__ == "__main__":
-    DATASET_PATH = "../data/TinyStoriesV2-GPT4-train.txt"
+    DATASET_PATH = "../data/owt_train.txt"
 
     if os.path.exists(DATASET_PATH):
-        train_bpe_tinystories(
+        train_bpe_streamed(
             input_path=DATASET_PATH,
-            vocab_size=10000,
+            vocab_size=32000,
             special_tokens=["<|endoftext|>"],
+            chunk_size_mb=64,
+            vocab_out_path="owt_vocab.json",
+            merges_out_path="owt_merges.json",
         )
     else:
         print(f"File '{DATASET_PATH}' not found! Please check your dataset path.")
